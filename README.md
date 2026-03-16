@@ -19,11 +19,6 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 
 1. Place your Apple private key as `AuthKey.p8` in the project root
 2. Place your Google service account key as `google-service-account.json` in the project root
-3. Update the configuration constants in `reviews.go`:
-   - `appleKeyID` — your App Store Connect key ID
-   - `appleIssuerID` — your issuer ID
-   - `appleAppID` — your Apple app ID
-   - `googlePackageName` — your Android package name
 
 ## Build & Run
 
