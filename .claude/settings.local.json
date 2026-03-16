@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm init -y)",
+      "Bash(npm install express)",
+      "Bash(ngrok version)",
+      "Bash(brew install ngrok)",
+      "Bash(curl -s http://127.0.0.1:4040/api/tunnels)",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); print\\(data[''tunnels''][0][''public_url'']\\)\")",
+      "Bash(curl -s http://localhost:3000/webhook)",
+      "Bash(go build:*)",
+      "Read(//usr/local/go/bin/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(ls -la /Users/ali/Desktop/Projects/test-appsflyer-push-api/AuthKey*.p8 /Users/ali/Desktop/Projects/test-appsflyer-push-api/google-service-account.json)",
+      "Bash(/opt/homebrew/bin/go build:*)",
+      "Bash(/Users/ali/Desktop/Projects/test-appsflyer-push-api/reviews)"
+    ]
+  }
+}
