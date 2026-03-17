@@ -2,11 +2,11 @@
 *.p8
 google-service-account.json
 
-# Build output
-reviews
-
 # CSV exports
 reviews_export/
+
+# Downloaded GCS review data
+gcs_reviews/
 
 # Dependencies
 node_modules/

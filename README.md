@@ -5,7 +5,7 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 ## Features
 
 - Fetches iOS reviews via App Store Connect API
-- Fetches Android reviews via Google Play Developer API
+- Fetches Android reviews via Google Cloud Storage monthly exports (full history, not limited to 7 days)
 - Filters reviews by date (defaults to last 31 days)
 - Exports all reviews to a CSV file (auto-opens on completion)
 
@@ -13,12 +13,17 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 
 - Go 1.21+
 - An Apple App Store Connect API key (`.p8` file)
-- A Google Play service account JSON key with Android Publisher API access
+- A Google Play service account JSON key with access to the GCS review exports bucket
 
 ## Setup
 
 1. Place your Apple private key as `AuthKey.p8` in the project root
 2. Place your Google service account key as `google-service-account.json` in the project root
+3. Update the configuration constants in `reviews.go`:
+   - `appleKeyID` — your App Store Connect key ID
+   - `appleIssuerID` — your issuer ID
+   - `appleAppID` — your Apple app ID
+   - `googlePackageName` — your Android package name
 
 ## Build & Run
 

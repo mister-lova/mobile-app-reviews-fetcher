@@ -13,7 +13,22 @@
       "Read(//opt/homebrew/bin/**)",
       "Bash(ls -la /Users/ali/Desktop/Projects/test-appsflyer-push-api/AuthKey*.p8 /Users/ali/Desktop/Projects/test-appsflyer-push-api/google-service-account.json)",
       "Bash(/opt/homebrew/bin/go build:*)",
-      "Bash(/Users/ali/Desktop/Projects/test-appsflyer-push-api/reviews)"
+      "Bash(/Users/ali/Desktop/Projects/test-appsflyer-push-api/reviews)",
+      "WebSearch",
+      "Bash(go mod:*)",
+      "Bash(go get:*)",
+      "Bash(go vet:*)",
+      "Bash(gsutil iam:*)",
+      "Bash(gcloud storage:*)",
+      "Bash(brew install:*)",
+      "Bash(gcloud auth:*)",
+      "Bash(gsutil ls:*)",
+      "Bash(gsutil -m cp \"gs://pubsite_prod_rev_04666068877155168208/reviews/reviews_com.dayuse_hotels.dayuseus_*.csv\" /Users/ali/Desktop/Projects/app-reviews-fetcher/gcs_reviews/)",
+      "Bash(gsutil -o \"GSUtil:parallel_process_count=1\" -m cp \"gs://pubsite_prod_rev_04666068877155168208/reviews/reviews_com.dayuse_hotels.dayuseus_*.csv\" /Users/ali/Desktop/Projects/app-reviews-fetcher/gcs_reviews/)",
+      "Bash(./reviews)",
+      "Bash(python3 -c \":*)",
+      "Bash(git add:*)",
+      "Bash(git rebase:*)"
     ]
   }
 }

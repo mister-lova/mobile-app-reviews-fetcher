@@ -1,10 +1,8 @@
 package main
 
 import (
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -14,15 +12,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	_ "embed"
+
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 // ============================================================
@@ -41,15 +42,11 @@ const googlePackageName = "com.dayuse_hotels.dayuseus"
 // EMBEDDED CREDENTIALS — place files next to this .go file
 // before running `go build`
 //
-//   AuthKey.p8                — your Apple private key
-//   google-service-account.json — your Google service account key
+//   AuthKey.p8 — your Apple private key
 // ============================================================
 
 //go:embed AuthKey.p8
 var applePrivateKey []byte
-
-//go:embed google-service-account.json
-var googleServiceAccount []byte
 
 // ============================================================
 
@@ -77,34 +74,22 @@ func main() {
 	var allReviews []Review
 
 	// Fetch iOS reviews
-	fmt.Println("── iOS App Store Reviews ──────────────────────")
+	fmt.Print("Fetching iOS reviews... ")
 	iosReviews, err := fetchAppleReviews(sinceDate)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-	} else if len(iosReviews) == 0 {
-		fmt.Println("  No reviews found since", dateInput)
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 	} else {
-		fmt.Printf("  Found %d review(s)\n", len(iosReviews))
-		for _, r := range iosReviews {
-			printReview(r)
-		}
+		fmt.Printf("✓ %d review(s)\n", len(iosReviews))
 		allReviews = append(allReviews, iosReviews...)
 	}
 
-	fmt.Println()
-
 	// Fetch Android reviews
-	fmt.Println("── Google Play Reviews ────────────────────────")
+	fmt.Print("Fetching Android reviews... ")
 	androidReviews, err := fetchGoogleReviews(sinceDate)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-	} else if len(androidReviews) == 0 {
-		fmt.Println("  No reviews found since", dateInput)
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 	} else {
-		fmt.Printf("  Found %d review(s)\n", len(androidReviews))
-		for _, r := range androidReviews {
-			printReview(r)
-		}
+		fmt.Printf("✓ %d review(s)\n", len(androidReviews))
 		allReviews = append(allReviews, androidReviews...)
 	}
 
@@ -112,7 +97,6 @@ func main() {
 
 	// Export to CSV
 	if len(allReviews) > 0 {
-		// Create reviews_export directory next to the binary
 		exeDir := "."
 		if exePath, err := os.Executable(); err == nil {
 			exeDir = filepath.Dir(exePath)
@@ -124,11 +108,13 @@ func main() {
 		csvFile := filepath.Join(exportDir, fmt.Sprintf("reviews_%s_to_%s.csv", dateInput, today))
 
 		if err := exportCSV(csvFile, allReviews); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
+			fmt.Fprintf(os.Stderr, "✗ Error writing CSV: %v\n", err)
 		} else {
 			fmt.Printf("Exported %d review(s) to %s\n", len(allReviews), csvFile)
 			openFile(csvFile)
 		}
+	} else {
+		fmt.Println("No reviews found since", dateInput)
 	}
 
 	fmt.Println("Done.")
@@ -138,6 +124,8 @@ func main() {
 // Common
 // ============================================================
 
+var errNotFound = fmt.Errorf("not found")
+
 type Review struct {
 	Platform string
 	Author   string
@@ -145,15 +133,6 @@ type Review struct {
 	Body     string
 	Rating   int
 	Date     string
-}
-
-func printReview(r Review) {
-	stars := strings.Repeat("★", r.Rating) + strings.Repeat("☆", 5-r.Rating)
-	fmt.Printf("\n  %s  %s  —  %s\n", stars, r.Date, r.Author)
-	if r.Title != "" {
-		fmt.Printf("  %s\n", r.Title)
-	}
-	fmt.Printf("  %s\n", r.Body)
 }
 
 // ============================================================
@@ -287,171 +266,117 @@ func createAppleJWT() (string, error) {
 }
 
 // ============================================================
-// Google Play Developer API
+// Google Play Reviews via local GCS CSV exports
+//
+// Sync reviews from GCS before building:
+//   gsutil -m cp "gs://pubsite_prod_rev_XXXX/reviews/reviews_PACKAGE_*.csv" gcs_reviews/
 // ============================================================
 
 func fetchGoogleReviews(since time.Time) ([]Review, error) {
-	token, err := createGoogleAccessToken()
-	if err != nil {
-		return nil, fmt.Errorf("getting access token: %w", err)
+	// Resolve gcs_reviews dir relative to the executable (or cwd as fallback)
+	exeDir := "."
+	if exePath, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(exePath)
+	}
+	reviewsDir := filepath.Join(exeDir, "gcs_reviews")
+
+	// Determine which monthly CSV files we need (from since month to current month)
+	now := time.Now()
+	var months []string
+	cursor := time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	for !cursor.After(end) {
+		months = append(months, cursor.Format("200601"))
+		cursor = cursor.AddDate(0, 1, 0)
 	}
 
 	var allReviews []Review
-	nextToken := ""
-
-	for {
-		u := fmt.Sprintf(
-			"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/%s/reviews?maxResults=100",
-			googlePackageName,
-		)
-		if nextToken != "" {
-			u += "&token=" + url.QueryEscape(nextToken)
+	for _, month := range months {
+		csvPath := filepath.Join(reviewsDir, fmt.Sprintf("reviews_%s_%s.csv", googlePackageName, month))
+		reviews, err := parseGCSReviewCSV(csvPath, since)
+		if os.IsNotExist(err) {
+			continue // no data for this month — expected
 		}
-
-		req, err := http.NewRequest("GET", u, nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("month %s: %w", month, err)
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
-		}
-
-		var result struct {
-			Reviews []struct {
-				AuthorName string `json:"authorName"`
-				Comments   []struct {
-					UserComment struct {
-						Text         string `json:"text"`
-						StarRating   int    `json:"starRating"`
-						LastModified struct {
-							Seconds string `json:"seconds"`
-						} `json:"lastModified"`
-					} `json:"userComment"`
-				} `json:"comments"`
-			} `json:"reviews"`
-			TokenPagination struct {
-				NextPageToken string `json:"nextPageToken"`
-			} `json:"tokenPagination"`
-		}
-
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("parsing response: %w", err)
-		}
-
-		for _, rv := range result.Reviews {
-			if len(rv.Comments) == 0 {
-				continue
-			}
-			uc := rv.Comments[0].UserComment
-
-			var secs int64
-			fmt.Sscanf(uc.LastModified.Seconds, "%d", &secs)
-			reviewTime := time.Unix(secs, 0)
-
-			if reviewTime.Before(since) {
-				continue
-			}
-
-			allReviews = append(allReviews, Review{
-				Platform: "Android",
-				Author:   rv.AuthorName,
-				Body:     uc.Text,
-				Rating:   uc.StarRating,
-				Date:     reviewTime.Format("2006-01-02 15:04"),
-			})
-		}
-
-		nextToken = result.TokenPagination.NextPageToken
-		if nextToken == "" {
-			break
-		}
+		allReviews = append(allReviews, reviews...)
 	}
 
 	return allReviews, nil
 }
 
-func createGoogleAccessToken() (string, error) {
-	var sa struct {
-		ClientEmail string `json:"client_email"`
-		PrivateKey  string `json:"private_key"`
-		TokenURI    string `json:"token_uri"`
-	}
-	if err := json.Unmarshal(googleServiceAccount, &sa); err != nil {
-		return "", fmt.Errorf("parsing service account JSON: %w", err)
-	}
-	if sa.TokenURI == "" {
-		sa.TokenURI = "https://oauth2.googleapis.com/token"
-	}
-
-	now := time.Now()
-	header := map[string]string{"alg": "RS256", "typ": "JWT"}
-	claims := map[string]interface{}{
-		"iss":   sa.ClientEmail,
-		"scope": "https://www.googleapis.com/auth/androidpublisher",
-		"aud":   sa.TokenURI,
-		"iat":   now.Unix(),
-		"exp":   now.Add(time.Hour).Unix(),
-	}
-
-	headerJSON, _ := json.Marshal(header)
-	claimsJSON, _ := json.Marshal(claims)
-	signingInput := b64url(headerJSON) + "." + b64url(claimsJSON)
-
-	block, _ := pem.Decode([]byte(sa.PrivateKey))
-	if block == nil {
-		return "", fmt.Errorf("failed to decode service account PEM key")
-	}
-
-	parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+func parseGCSReviewCSV(csvPath string, since time.Time) ([]Review, error) {
+	f, err := os.Open(csvPath)
 	if err != nil {
-		return "", fmt.Errorf("parsing RSA key: %w", err)
+		return nil, err
 	}
+	defer f.Close()
 
-	rsaKey, ok := parsedKey.(*rsa.PrivateKey)
-	if !ok {
-		return "", fmt.Errorf("key is not RSA")
-	}
+	// Google exports CSVs in UTF-16LE with BOM — decode to UTF-8
+	utf16Reader := transform.NewReader(f, unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder())
 
-	hash := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, hash[:])
+	r := csv.NewReader(utf16Reader)
+	r.LazyQuotes = true
+
+	header, err := r.Read()
 	if err != nil {
-		return "", fmt.Errorf("signing JWT: %w", err)
+		return nil, fmt.Errorf("reading CSV header: %w", err)
 	}
 
-	jwt := signingInput + "." + b64url(sig)
-
-	// Exchange JWT assertion for an access token
-	resp, err := http.PostForm(sa.TokenURI, url.Values{
-		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
-		"assertion":  {jwt},
-	})
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("token exchange failed %d: %s", resp.StatusCode, truncate(string(body), 300))
+	// Build column index map so we don't rely on fixed positions
+	col := make(map[string]int)
+	for i, name := range header {
+		col[name] = i
 	}
 
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return "", err
+	// Required columns
+	needed := []string{"Review Submit Millis Since Epoch", "Star Rating", "Review Text"}
+	for _, n := range needed {
+		if _, ok := col[n]; !ok {
+			return nil, fmt.Errorf("missing expected column %q in CSV", n)
+		}
 	}
 
-	return tokenResp.AccessToken, nil
+	var reviews []Review
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue // skip malformed rows
+		}
+
+		millis, _ := strconv.ParseInt(record[col["Review Submit Millis Since Epoch"]], 10, 64)
+		reviewTime := time.UnixMilli(millis)
+		if reviewTime.Before(since) {
+			continue
+		}
+
+		body := strings.TrimSpace(record[col["Review Text"]])
+		if body == "" {
+			continue // skip reviews with no comment
+		}
+
+		rating, _ := strconv.Atoi(record[col["Star Rating"]])
+
+		title := ""
+		if idx, ok := col["Review Title"]; ok && idx < len(record) {
+			title = strings.TrimSpace(record[idx])
+		}
+
+		reviews = append(reviews, Review{
+			Platform: "Android",
+			Author:   "", // GCS exports don't include author names
+			Title:    title,
+			Body:     body,
+			Rating:   rating,
+			Date:     reviewTime.Format("2006-01-02 15:04"),
+		})
+	}
+
+	return reviews, nil
 }
 
 // ============================================================
