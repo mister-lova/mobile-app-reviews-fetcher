@@ -2,6 +2,9 @@
 *.p8
 google-service-account.json
 
+# Build output
+reviews
+
 # CSV exports
 reviews_export/
 
