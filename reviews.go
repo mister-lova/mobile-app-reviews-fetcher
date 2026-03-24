@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
@@ -22,8 +23,10 @@ import (
 
 	_ "embed"
 
+	"cloud.google.com/go/storage"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
+	"google.golang.org/api/option"
 )
 
 // ============================================================
@@ -37,6 +40,8 @@ const appleAppID = "1068461104"
 
 // Google Play
 const googlePackageName = "com.dayuse_hotels.dayuseus"
+const gcsBucket = "pubsite_prod_rev_04666068877155168208"
+const gcsPrefix = "reviews/reviews_" + googlePackageName + "_"
 
 // ============================================================
 // EMBEDDED CREDENTIALS — place files next to this .go file
@@ -47,6 +52,9 @@ const googlePackageName = "com.dayuse_hotels.dayuseus"
 
 //go:embed AuthKey.p8
 var applePrivateKey []byte
+
+//go:embed google-service-account.json
+var googleServiceAccount []byte
 
 // ============================================================
 
@@ -266,19 +274,18 @@ func createAppleJWT() (string, error) {
 }
 
 // ============================================================
-// Google Play Reviews via local GCS CSV exports
-//
-// Sync reviews from GCS before building:
-//   gsutil -m cp "gs://pubsite_prod_rev_XXXX/reviews/reviews_PACKAGE_*.csv" gcs_reviews/
+// Google Play Reviews via GCS (fetched at runtime)
 // ============================================================
 
 func fetchGoogleReviews(since time.Time) ([]Review, error) {
-	// Resolve gcs_reviews dir relative to the executable (or cwd as fallback)
-	exeDir := "."
-	if exePath, err := os.Executable(); err == nil {
-		exeDir = filepath.Dir(exePath)
+	ctx := context.Background()
+	client, err := storage.NewClient(ctx, option.WithCredentialsJSON(googleServiceAccount))
+	if err != nil {
+		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
-	reviewsDir := filepath.Join(exeDir, "gcs_reviews")
+	defer client.Close()
+
+	bucket := client.Bucket(gcsBucket)
 
 	// Determine which monthly CSV files we need (from since month to current month)
 	now := time.Now()
@@ -292,9 +299,9 @@ func fetchGoogleReviews(since time.Time) ([]Review, error) {
 
 	var allReviews []Review
 	for _, month := range months {
-		csvPath := filepath.Join(reviewsDir, fmt.Sprintf("reviews_%s_%s.csv", googlePackageName, month))
-		reviews, err := parseGCSReviewCSV(csvPath, since)
-		if os.IsNotExist(err) {
+		objectName := gcsPrefix + month + ".csv"
+		reviews, err := fetchAndParseGCSCSV(ctx, bucket, objectName, since)
+		if err == errNotFound {
 			continue // no data for this month — expected
 		}
 		if err != nil {
@@ -306,15 +313,29 @@ func fetchGoogleReviews(since time.Time) ([]Review, error) {
 	return allReviews, nil
 }
 
-func parseGCSReviewCSV(csvPath string, since time.Time) ([]Review, error) {
-	f, err := os.Open(csvPath)
-	if err != nil {
-		return nil, err
+func fetchAndParseGCSCSV(ctx context.Context, bucket *storage.BucketHandle, objectName string, since time.Time) ([]Review, error) {
+	// Check if the object exists first
+	obj := bucket.Object(objectName)
+	_, err := obj.Attrs(ctx)
+	if err == storage.ErrObjectNotExist {
+		return nil, errNotFound
 	}
-	defer f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("checking object %s: %w", objectName, err)
+	}
 
+	rc, err := obj.NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading object %s: %w", objectName, err)
+	}
+	defer rc.Close()
+
+	return parseGCSReviewCSV(rc, since)
+}
+
+func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 	// Google exports CSVs in UTF-16LE with BOM — decode to UTF-8
-	utf16Reader := transform.NewReader(f, unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder())
+	utf16Reader := transform.NewReader(reader, unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder())
 
 	r := csv.NewReader(utf16Reader)
 	r.LazyQuotes = true

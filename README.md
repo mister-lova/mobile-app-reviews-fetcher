@@ -5,7 +5,7 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 ## Features
 
 - Fetches iOS reviews via App Store Connect API
-- Fetches Android reviews via Google Cloud Storage monthly exports (full history, not limited to 7 days)
+- Fetches Android reviews directly from Google Cloud Storage at runtime (full history, not limited to 7 days)
 - Filters reviews by date (defaults to last 31 days)
 - Exports all reviews to a CSV file (auto-opens on completion)
 
@@ -19,7 +19,8 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 
 1. Place your Apple private key as `AuthKey.p8` in the project root
 2. Place your Google service account key as `google-service-account.json` in the project root
-3. Update the configuration constants in `reviews.go`:
+3. Both files are embedded into the binary at build time — only needed when compiling, not when running
+4. Update the configuration constants in `reviews.go`:
    - `appleKeyID` — your App Store Connect key ID
    - `appleIssuerID` — your issuer ID
    - `appleAppID` — your Apple app ID
@@ -29,10 +30,16 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 
 ```bash
 go build -o reviews reviews.go
+
+# Ad-hoc sign so macOS doesn't block the binary when shared
+codesign --force --sign - reviews
+
 ./reviews
 ```
 
 You'll be prompted for a start date (defaults to 31 days ago). Reviews are printed to the terminal and exported to `reviews_export/`.
+
+> **Sharing the binary:** The ad-hoc codesign is sufficient for Apple Silicon Macs. If a recipient still sees a Gatekeeper warning, they can run `xattr -cr ./reviews` before executing it.
 
 ## Webhook Server (optional)
 
