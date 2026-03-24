@@ -3,7 +3,7 @@
 google-service-account.json
 
 # Build output
-reviews
+app-reviews-fetcher
 
 # CSV exports
 reviews_export/

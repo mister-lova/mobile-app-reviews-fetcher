@@ -29,17 +29,17 @@ CLI tool that fetches app reviews from the **Apple App Store** and **Google Play
 ## Build & Run
 
 ```bash
-go build -o reviews reviews.go
+go build -o app-reviews-fetcher reviews.go
 
 # Ad-hoc sign so macOS doesn't block the binary when shared
-codesign --force --sign - reviews
+codesign --force --sign - app-reviews-fetcher
 
-./reviews
+./app-reviews-fetcher
 ```
 
 You'll be prompted for a start date (defaults to 31 days ago). Reviews are printed to the terminal and exported to `reviews_export/`.
 
-> **Sharing the binary:** The ad-hoc codesign is sufficient for Apple Silicon Macs. If a recipient still sees a Gatekeeper warning, they can run `xattr -cr ./reviews` before executing it.
+> **Sharing the binary:** The ad-hoc codesign is sufficient for Apple Silicon Macs. If a recipient still sees a Gatekeeper warning, they can run `xattr -cr ./app-reviews-fetcher` before executing it.
 
 ## Webhook Server (optional)
 
