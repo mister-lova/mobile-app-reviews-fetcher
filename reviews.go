@@ -59,6 +59,16 @@ var trustpilotDomains = []string{
 	"www.dayuse.nl",
 }
 
+var domainCountry = map[string]string{
+	"www.dayuse.com":       "US",
+	"www.dayuse.fr":        "FR",
+	"www.dayuse.co.uk":     "GB",
+	"www.dayuse-hotels.it": "IT",
+	"www.dayuse.de":        "DE",
+	"www.dayuse.es":        "ES",
+	"www.dayuse.nl":        "NL",
+}
+
 // ============================================================
 // EMBEDDED CREDENTIALS — place files next to this .go file
 // before running `go build`
@@ -242,6 +252,8 @@ type Review struct {
 	Rating   int
 	Date     string
 	Version  string
+	Language string
+	Country  string
 	Domain   string
 }
 
@@ -350,6 +362,7 @@ func fetchAppleReviews(since time.Time) ([]Review, error) {
 							Body             string `json:"body"`
 							ReviewerNickname string `json:"reviewerNickname"`
 							CreatedDate      string `json:"createdDate"`
+							Territory        string `json:"territory"`
 						} `json:"attributes"`
 					} `json:"data"`
 					Links struct {
@@ -376,6 +389,7 @@ func fetchAppleReviews(since time.Time) ([]Review, error) {
 						Rating:   d.Attributes.Rating,
 						Date:     d.Attributes.CreatedDate[:10],
 						Version:  v.version,
+						Country:  d.Attributes.Territory,
 					})
 				}
 				nextURL = result.Links.Next
@@ -583,6 +597,18 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 			version = strings.TrimSpace(record[idx])
 		}
 
+		lang, country := "", ""
+		if idx, ok := col["Reviewer Language"]; ok && idx < len(record) {
+			tag := strings.TrimSpace(record[idx])
+			parts := strings.SplitN(tag, "-", 2)
+			if parts[0] != "" {
+				lang = parts[0]
+			}
+			if len(parts) == 2 {
+				country = parts[1]
+			}
+		}
+
 		reviews = append(reviews, Review{
 			Platform: "Android",
 			Author:   "", // GCS exports don't include author names
@@ -591,6 +617,8 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 			Rating:   rating,
 			Date:     reviewTime.Format("2006-01-02 15:04"),
 			Version:  version,
+			Language: lang,
+			Country:  country,
 		})
 	}
 
@@ -733,6 +761,7 @@ func fetchTrustpilotReviews(since time.Time, token, domain string) ([]Review, er
 				Rating:   r.Stars,
 				Date:     date,
 				Domain:   domain,
+				Country:  domainCountry[domain],
 			})
 		}
 		page++
@@ -861,7 +890,7 @@ func exportXLSX(filename string, reviews []Review, versions []VersionRelease) er
 	sheet1 := "Reviews"
 	f.SetSheetName("Sheet1", sheet1)
 
-	reviewHeaders := []string{"Platform", "Date", "Rating", "Author", "Title", "Version", "Domain", "Review"}
+	reviewHeaders := []string{"Platform", "Date", "Rating", "Author", "Title", "Version", "Language", "Country", "Review"}
 	for i, h := range reviewHeaders {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheet1, cell, h)
@@ -876,8 +905,9 @@ func exportXLSX(filename string, reviews []Review, versions []VersionRelease) er
 		f.SetCellValue(sheet1, cellName(4, rowNum), r.Author)
 		f.SetCellValue(sheet1, cellName(5, rowNum), r.Title)
 		f.SetCellValue(sheet1, cellName(6, rowNum), r.Version)
-		f.SetCellValue(sheet1, cellName(7, rowNum), r.Domain)
-		f.SetCellValue(sheet1, cellName(8, rowNum), r.Body)
+		f.SetCellValue(sheet1, cellName(7, rowNum), r.Language)
+		f.SetCellValue(sheet1, cellName(8, rowNum), r.Country)
+		f.SetCellValue(sheet1, cellName(9, rowNum), r.Body)
 	}
 
 	// --- Sheet 2: Version History ---
