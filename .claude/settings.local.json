@@ -28,7 +28,19 @@
       "Bash(./reviews)",
       "Bash(python3 -c \":*)",
       "Bash(git add:*)",
-      "Bash(git rebase:*)"
+      "Bash(git rebase:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(lipo -info /Users/ali/Desktop/Projects/app-reviews-fetcher/reviews)",
+      "Bash(otool -L /Users/ali/Desktop/Projects/app-reviews-fetcher/reviews)",
+      "Bash(codesign -v /Users/ali/Desktop/Projects/app-reviews-fetcher/reviews)",
+      "Bash(git log:*)",
+      "Bash(codesign --force --sign - reviews)",
+      "Bash(codesign -v reviews)",
+      "Bash(git checkout:*)",
+      "Bash(codesign --force --sign - app-reviews-fetcher)",
+      "Bash(codesign -v app-reviews-fetcher)"
     ]
   }
 }

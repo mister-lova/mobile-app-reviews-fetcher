@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
-	"errors"
 	"crypto/rand"
+	"errors"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "embed"
@@ -82,42 +83,62 @@ func main() {
 
 	fmt.Println()
 
+	fmt.Println("Fetching iOS reviews, Android reviews, and iOS version history in parallel...")
+
+	var (
+		iosReviews     []Review
+		iosReviewsErr  error
+		androidReviews []Review
+		androidErr     error
+		iosVersions    []VersionRelease
+		iosVersionsErr error
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		iosReviews, iosReviewsErr = fetchAppleReviews(sinceDate)
+	}()
+	go func() {
+		defer wg.Done()
+		androidReviews, androidErr = fetchGoogleReviews(sinceDate)
+	}()
+	go func() {
+		defer wg.Done()
+		iosVersions, iosVersionsErr = fetchAppleVersionHistory()
+	}()
+
+	wg.Wait()
+
 	var allReviews []Review
 
-	// Fetch iOS reviews
-	fmt.Print("Fetching iOS reviews... ")
-	iosReviews, err := fetchAppleReviews(sinceDate)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+	if iosReviewsErr != nil {
+		fmt.Fprintf(os.Stderr, "✗ iOS reviews: %v\n", iosReviewsErr)
 	} else {
-		fmt.Printf("✓ %d review(s)\n", len(iosReviews))
+		fmt.Printf("✓ iOS reviews: %d\n", len(iosReviews))
 		allReviews = append(allReviews, iosReviews...)
 	}
 
-	// Fetch Android reviews
-	fmt.Print("Fetching Android reviews... ")
-	androidReviews, err := fetchGoogleReviews(sinceDate)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+	if androidErr != nil {
+		fmt.Fprintf(os.Stderr, "✗ Android reviews: %v\n", androidErr)
 	} else {
-		fmt.Printf("✓ %d review(s)\n", len(androidReviews))
+		fmt.Printf("✓ Android reviews: %d\n", len(androidReviews))
 		allReviews = append(allReviews, androidReviews...)
 	}
 
-	// Fetch version history
 	var allVersions []VersionRelease
 
-	fmt.Print("Fetching iOS version history... ")
-	iosVersions, err := fetchAppleVersionHistory()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+	if iosVersionsErr != nil {
+		fmt.Fprintf(os.Stderr, "✗ iOS version history: %v\n", iosVersionsErr)
 	} else {
-		fmt.Printf("✓ %d version(s)\n", len(iosVersions))
+		fmt.Printf("✓ iOS version history: %d version(s)\n", len(iosVersions))
 		allVersions = append(allVersions, iosVersions...)
 	}
 
 	androidVersions := deriveAndroidVersionHistory(allReviews)
-	fmt.Printf("Derived %d Android version(s) from reviews\n", len(androidVersions))
+	fmt.Printf("✓ Android version history: %d version(s) derived from reviews\n", len(androidVersions))
 	allVersions = append(allVersions, androidVersions...)
 
 	fmt.Println()
@@ -221,70 +242,94 @@ func fetchAppleReviews(since time.Time) ([]Review, error) {
 		versionsURL = vResult.Links.Next
 	}
 
-	// Fetch reviews per version
-	var allReviews []Review
-	for _, v := range versions {
-		nextURL := fmt.Sprintf(
-			"https://api.appstoreconnect.apple.com/v1/appStoreVersions/%s/customerReviews?sort=-createdDate&limit=100",
-			v.id,
-		)
-		done := false
-		for nextURL != "" && !done {
-			req, err := http.NewRequest("GET", nextURL, nil)
-			if err != nil {
-				return nil, err
-			}
-			req.Header.Set("Authorization", "Bearer "+token)
+	// Fetch reviews per version in parallel
+	type versionResult struct {
+		reviews []Review
+		err     error
+	}
+	results := make([]versionResult, len(versions))
 
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-
-			if resp.StatusCode != 200 {
-				return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
-			}
-
-			var result struct {
-				Data []struct {
-					Attributes struct {
-						Rating           int    `json:"rating"`
-						Title            string `json:"title"`
-						Body             string `json:"body"`
-						ReviewerNickname string `json:"reviewerNickname"`
-						CreatedDate      string `json:"createdDate"`
-					} `json:"attributes"`
-				} `json:"data"`
-				Links struct {
-					Next string `json:"next"`
-				} `json:"links"`
-			}
-
-			if err := json.Unmarshal(body, &result); err != nil {
-				return nil, fmt.Errorf("parsing response: %w", err)
-			}
-
-			for _, d := range result.Data {
-				t, err := time.Parse(time.RFC3339, d.Attributes.CreatedDate)
-				if err == nil && t.Before(since) {
-					done = true
-					break
+	var reviewsWg sync.WaitGroup
+	for i, v := range versions {
+		reviewsWg.Add(1)
+		go func(i int, v versionInfo) {
+			defer reviewsWg.Done()
+			var vReviews []Review
+			nextURL := fmt.Sprintf(
+				"https://api.appstoreconnect.apple.com/v1/appStoreVersions/%s/customerReviews?sort=-createdDate&limit=100",
+				v.id,
+			)
+			done := false
+			for nextURL != "" && !done {
+				req, err := http.NewRequest("GET", nextURL, nil)
+				if err != nil {
+					results[i] = versionResult{err: err}
+					return
 				}
-				allReviews = append(allReviews, Review{
-					Platform: "iOS",
-					Author:   d.Attributes.ReviewerNickname,
-					Title:    d.Attributes.Title,
-					Body:     d.Attributes.Body,
-					Rating:   d.Attributes.Rating,
-					Date:     d.Attributes.CreatedDate[:10],
-					Version:  v.version,
-				})
-			}
+				req.Header.Set("Authorization", "Bearer "+token)
 
-			nextURL = result.Links.Next
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					results[i] = versionResult{err: err}
+					return
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if resp.StatusCode != 200 {
+					results[i] = versionResult{err: fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))}
+					return
+				}
+
+				var result struct {
+					Data []struct {
+						Attributes struct {
+							Rating           int    `json:"rating"`
+							Title            string `json:"title"`
+							Body             string `json:"body"`
+							ReviewerNickname string `json:"reviewerNickname"`
+							CreatedDate      string `json:"createdDate"`
+						} `json:"attributes"`
+					} `json:"data"`
+					Links struct {
+						Next string `json:"next"`
+					} `json:"links"`
+				}
+
+				if err := json.Unmarshal(body, &result); err != nil {
+					results[i] = versionResult{err: fmt.Errorf("parsing response: %w", err)}
+					return
+				}
+
+				for _, d := range result.Data {
+					t, err := time.Parse(time.RFC3339, d.Attributes.CreatedDate)
+					if err == nil && t.Before(since) {
+						done = true
+						break
+					}
+					vReviews = append(vReviews, Review{
+						Platform: "iOS",
+						Author:   d.Attributes.ReviewerNickname,
+						Title:    d.Attributes.Title,
+						Body:     d.Attributes.Body,
+						Rating:   d.Attributes.Rating,
+						Date:     d.Attributes.CreatedDate[:10],
+						Version:  v.version,
+					})
+				}
+				nextURL = result.Links.Next
+			}
+			results[i] = versionResult{reviews: vReviews}
+		}(i, v)
+	}
+	reviewsWg.Wait()
+
+	var allReviews []Review
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
+		allReviews = append(allReviews, r.reviews...)
 	}
 
 	return allReviews, nil
@@ -366,17 +411,33 @@ func fetchGoogleReviews(since time.Time) ([]Review, error) {
 		cursor = cursor.AddDate(0, 1, 0)
 	}
 
+	type monthResult struct {
+		reviews []Review
+		err     error
+	}
+	results := make([]monthResult, len(months))
+
+	var wg sync.WaitGroup
+	for i, month := range months {
+		wg.Add(1)
+		go func(i int, month string) {
+			defer wg.Done()
+			objectName := gcsPrefix + month + ".csv"
+			reviews, err := fetchAndParseGCSCSV(ctx, bucket, objectName, since)
+			results[i] = monthResult{reviews: reviews, err: err}
+		}(i, month)
+	}
+	wg.Wait()
+
 	var allReviews []Review
-	for _, month := range months {
-		objectName := gcsPrefix + month + ".csv"
-		reviews, err := fetchAndParseGCSCSV(ctx, bucket, objectName, since)
-		if err == errNotFound {
-			continue // no data for this month — expected
+	for i, r := range results {
+		if r.err == errNotFound {
+			continue
 		}
-		if err != nil {
-			return nil, fmt.Errorf("month %s: %w", month, err)
+		if r.err != nil {
+			return nil, fmt.Errorf("month %s: %w", months[i], r.err)
 		}
-		allReviews = append(allReviews, reviews...)
+		allReviews = append(allReviews, r.reviews...)
 	}
 
 	return allReviews, nil
