@@ -4,16 +4,17 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
-	"errors"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,11 +48,24 @@ const googlePackageName = "com.dayuse_hotels.dayuseus"
 const gcsBucket = "pubsite_prod_rev_04666068877155168208"
 const gcsPrefix = "reviews/reviews_" + googlePackageName + "_"
 
+// Trustpilot
+var trustpilotDomains = []string{
+	"www.dayuse.com",
+	"www.dayuse.fr",
+	"www.dayuse.co.uk",
+	"www.dayuse-hotels.it",
+	"www.dayuse.de",
+	"www.dayuse.es",
+	"www.dayuse.nl",
+}
+
 // ============================================================
 // EMBEDDED CREDENTIALS — place files next to this .go file
 // before running `go build`
 //
-//   AuthKey.p8 — your Apple private key
+//   AuthKey.p8                   — your Apple private key
+//   google-service-account.json  — your Google service account
+//   trustpilot-credentials.json  — your Trustpilot API key/secret
 // ============================================================
 
 //go:embed AuthKey.p8
@@ -60,10 +74,24 @@ var applePrivateKey []byte
 //go:embed google-service-account.json
 var googleServiceAccount []byte
 
+//go:embed trustpilot-credentials.json
+var trustpilotCredentialsJSON []byte
+
+var trustpilotCredentials struct {
+	APIKey    string `json:"api_key"`
+	APISecret string `json:"api_secret"`
+}
+
+func init() {
+	if err := json.Unmarshal(trustpilotCredentialsJSON, &trustpilotCredentials); err != nil {
+		panic("failed to parse trustpilot-credentials.json: " + err.Error())
+	}
+}
+
 // ============================================================
 
 func main() {
-	fmt.Println("=== App Reviews Fetcher ===")
+	fmt.Println("=== Reviews Fetcher ===")
 	fmt.Println()
 
 	defaultDate := time.Now().AddDate(0, 0, -31).Format("2006-01-02")
@@ -83,7 +111,14 @@ func main() {
 
 	fmt.Println()
 
-	fmt.Println("Fetching iOS reviews, Android reviews, and iOS version history in parallel...")
+	fmt.Println("Fetching all reviews in parallel...")
+
+	// Obtain Trustpilot token upfront (single token shared across all domain fetches)
+	tpToken, err := createTrustpilotToken()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Trustpilot auth: %v\n", err)
+		tpToken = ""
+	}
 
 	var (
 		iosReviews     []Review
@@ -94,8 +129,14 @@ func main() {
 		iosVersionsErr error
 	)
 
+	// Per-domain Trustpilot results
+	tpResults := make([]struct {
+		reviews []Review
+		err     error
+	}, len(trustpilotDomains))
+
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(3 + len(trustpilotDomains))
 
 	go func() {
 		defer wg.Done()
@@ -109,6 +150,16 @@ func main() {
 		defer wg.Done()
 		iosVersions, iosVersionsErr = fetchAppleVersionHistory()
 	}()
+	for i, domain := range trustpilotDomains {
+		go func(i int, domain string) {
+			defer wg.Done()
+			if tpToken == "" {
+				tpResults[i].err = fmt.Errorf("no auth token")
+				return
+			}
+			tpResults[i].reviews, tpResults[i].err = fetchTrustpilotReviews(sinceDate, tpToken, domain)
+		}(i, domain)
+	}
 
 	wg.Wait()
 
@@ -126,6 +177,15 @@ func main() {
 	} else {
 		fmt.Printf("✓ Android reviews: %d\n", len(androidReviews))
 		allReviews = append(allReviews, androidReviews...)
+	}
+
+	for i, domain := range trustpilotDomains {
+		if tpResults[i].err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Trustpilot %s: %v\n", domain, tpResults[i].err)
+		} else {
+			fmt.Printf("✓ Trustpilot %s: %d\n", domain, len(tpResults[i].reviews))
+			allReviews = append(allReviews, tpResults[i].reviews...)
+		}
 	}
 
 	var allVersions []VersionRelease
@@ -182,6 +242,7 @@ type Review struct {
 	Rating   int
 	Date     string
 	Version  string
+	Domain   string
 }
 
 type VersionRelease struct {
@@ -537,6 +598,150 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 }
 
 // ============================================================
+// Trustpilot Reviews
+// ============================================================
+
+func createTrustpilotToken() (string, error) {
+	creds := base64.StdEncoding.EncodeToString(
+		[]byte(trustpilotCredentials.APIKey + ":" + trustpilotCredentials.APISecret),
+	)
+
+	body := url.Values{}
+	body.Set("grant_type", "client_credentials")
+
+	req, err := http.NewRequest("POST",
+		"https://api.trustpilot.com/v1/oauth/oauth-business-users-for-applications/accesstoken",
+		strings.NewReader(body.Encode()),
+	)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Basic "+creds)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("token request returned %d: %s", resp.StatusCode, truncate(string(respBody), 300))
+	}
+
+	var result struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("parsing token response: %w", err)
+	}
+	if result.AccessToken == "" {
+		return "", fmt.Errorf("empty access token in response")
+	}
+	return result.AccessToken, nil
+}
+
+func fetchTrustpilotReviews(since time.Time, token, domain string) ([]Review, error) {
+	// Look up Business Unit ID for this domain
+	buURL := fmt.Sprintf(
+		"https://api.trustpilot.com/v1/business-units/find?name=%s&apikey=%s",
+		url.QueryEscape(domain), trustpilotCredentials.APIKey,
+	)
+	req, err := http.NewRequest("GET", buURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	buBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("business-units/find returned %d: %s", resp.StatusCode, truncate(string(buBody), 300))
+	}
+
+	var buResult struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(buBody, &buResult); err != nil {
+		return nil, fmt.Errorf("parsing business unit response: %w", err)
+	}
+	if buResult.ID == "" {
+		return nil, fmt.Errorf("no business unit found for domain %s", domain)
+	}
+
+	// Fetch reviews page by page
+	var allReviews []Review
+	page := 1
+	done := false
+	for !done {
+		reviewsURL := fmt.Sprintf(
+			"https://api.trustpilot.com/v1/business-units/%s/reviews?orderBy=createdat.desc&perPage=100&page=%d",
+			buResult.ID, page,
+		)
+		req, err := http.NewRequest("GET", reviewsURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("reviews API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
+		}
+
+		var result struct {
+			Reviews []struct {
+				Stars     int    `json:"stars"`
+				CreatedAt string `json:"createdAt"`
+				Text      string `json:"text"`
+				Consumer  struct {
+					DisplayName string `json:"displayName"`
+				} `json:"consumer"`
+			} `json:"reviews"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("parsing reviews response: %w", err)
+		}
+
+		if len(result.Reviews) == 0 {
+			break
+		}
+
+		for _, r := range result.Reviews {
+			t, err := time.Parse(time.RFC3339, r.CreatedAt)
+			if err == nil && t.Before(since) {
+				done = true
+				break
+			}
+			date := r.CreatedAt
+			if len(date) >= 10 {
+				date = date[:10]
+			}
+			allReviews = append(allReviews, Review{
+				Platform: "Trustpilot",
+				Author:   r.Consumer.DisplayName,
+				Body:     r.Text,
+				Rating:   r.Stars,
+				Date:     date,
+				Domain:   domain,
+			})
+		}
+		page++
+	}
+
+	return allReviews, nil
+}
+
+// ============================================================
 // Apple Version History
 // ============================================================
 
@@ -656,7 +861,7 @@ func exportXLSX(filename string, reviews []Review, versions []VersionRelease) er
 	sheet1 := "Reviews"
 	f.SetSheetName("Sheet1", sheet1)
 
-	reviewHeaders := []string{"Platform", "Date", "Rating", "Author", "Title", "Version", "Review"}
+	reviewHeaders := []string{"Platform", "Date", "Rating", "Author", "Title", "Version", "Domain", "Review"}
 	for i, h := range reviewHeaders {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheet1, cell, h)
@@ -671,7 +876,8 @@ func exportXLSX(filename string, reviews []Review, versions []VersionRelease) er
 		f.SetCellValue(sheet1, cellName(4, rowNum), r.Author)
 		f.SetCellValue(sheet1, cellName(5, rowNum), r.Title)
 		f.SetCellValue(sheet1, cellName(6, rowNum), r.Version)
-		f.SetCellValue(sheet1, cellName(7, rowNum), r.Body)
+		f.SetCellValue(sheet1, cellName(7, rowNum), r.Domain)
+		f.SetCellValue(sheet1, cellName(8, rowNum), r.Body)
 	}
 
 	// --- Sheet 2: Version History ---
