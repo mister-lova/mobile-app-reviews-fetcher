@@ -121,7 +121,7 @@ func main() {
 
 	fmt.Println()
 
-	fmt.Println("Fetching all reviews in parallel...")
+	fmt.Println("Fetching reviews...")
 
 	// Obtain Trustpilot token upfront (single token shared across all domain fetches)
 	tpToken, err := createTrustpilotToken()
@@ -151,10 +151,20 @@ func main() {
 	go func() {
 		defer wg.Done()
 		iosReviews, iosReviewsErr = fetchAppleReviews(sinceDate)
+		if iosReviewsErr != nil {
+			fmt.Fprintf(os.Stderr, "✗ iOS reviews: %v\n", iosReviewsErr)
+		} else {
+			fmt.Printf("✓ iOS reviews: %d\n", len(iosReviews))
+		}
 	}()
 	go func() {
 		defer wg.Done()
 		androidReviews, androidErr = fetchGoogleReviews(sinceDate)
+		if androidErr != nil {
+			fmt.Fprintf(os.Stderr, "✗ Android reviews: %v\n", androidErr)
+		} else {
+			fmt.Printf("✓ Android reviews: %d\n", len(androidReviews))
+		}
 	}()
 	go func() {
 		defer wg.Done()
@@ -165,9 +175,15 @@ func main() {
 			defer wg.Done()
 			if tpToken == "" {
 				tpResults[i].err = fmt.Errorf("no auth token")
+				fmt.Fprintf(os.Stderr, "✗ Trustpilot %s: no auth token\n", domain)
 				return
 			}
 			tpResults[i].reviews, tpResults[i].err = fetchTrustpilotReviews(sinceDate, tpToken, domain)
+			if tpResults[i].err != nil {
+				fmt.Fprintf(os.Stderr, "✗ Trustpilot %s: %v\n", domain, tpResults[i].err)
+			} else {
+				fmt.Printf("✓ Trustpilot %s: %d\n", domain, len(tpResults[i].reviews))
+			}
 		}(i, domain)
 	}
 
@@ -175,25 +191,15 @@ func main() {
 
 	var allReviews []Review
 
-	if iosReviewsErr != nil {
-		fmt.Fprintf(os.Stderr, "✗ iOS reviews: %v\n", iosReviewsErr)
-	} else {
-		fmt.Printf("✓ iOS reviews: %d\n", len(iosReviews))
+	if iosReviewsErr == nil {
 		allReviews = append(allReviews, iosReviews...)
 	}
-
-	if androidErr != nil {
-		fmt.Fprintf(os.Stderr, "✗ Android reviews: %v\n", androidErr)
-	} else {
-		fmt.Printf("✓ Android reviews: %d\n", len(androidReviews))
+	if androidErr == nil {
 		allReviews = append(allReviews, androidReviews...)
 	}
 
-	for i, domain := range trustpilotDomains {
-		if tpResults[i].err != nil {
-			fmt.Fprintf(os.Stderr, "✗ Trustpilot %s: %v\n", domain, tpResults[i].err)
-		} else {
-			fmt.Printf("✓ Trustpilot %s: %d\n", domain, len(tpResults[i].reviews))
+	for i := range trustpilotDomains {
+		if tpResults[i].err == nil {
 			allReviews = append(allReviews, tpResults[i].reviews...)
 		}
 	}
@@ -203,12 +209,10 @@ func main() {
 	if iosVersionsErr != nil {
 		fmt.Fprintf(os.Stderr, "✗ iOS version history: %v\n", iosVersionsErr)
 	} else {
-		fmt.Printf("✓ iOS version history: %d version(s)\n", len(iosVersions))
 		allVersions = append(allVersions, iosVersions...)
 	}
 
 	androidVersions := deriveAndroidVersionHistory(allReviews)
-	fmt.Printf("✓ Android version history: %d version(s) derived from reviews\n", len(androidVersions))
 	allVersions = append(allVersions, androidVersions...)
 
 	fmt.Println()
