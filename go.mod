@@ -1,4 +1,4 @@
-module app-reviews-fetcher
+module reviews-fetcher
 
 go 1.26.1
 
