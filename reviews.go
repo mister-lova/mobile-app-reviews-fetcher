@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -17,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +26,7 @@ import (
 	_ "embed"
 
 	"cloud.google.com/go/storage"
+	"github.com/xuri/excelize/v2"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 	"google.golang.org/api/option"
@@ -101,9 +104,25 @@ func main() {
 		allReviews = append(allReviews, androidReviews...)
 	}
 
+	// Fetch version history
+	var allVersions []VersionRelease
+
+	fmt.Print("Fetching iOS version history... ")
+	iosVersions, err := fetchAppleVersionHistory()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+	} else {
+		fmt.Printf("✓ %d version(s)\n", len(iosVersions))
+		allVersions = append(allVersions, iosVersions...)
+	}
+
+	androidVersions := deriveAndroidVersionHistory(allReviews)
+	fmt.Printf("Derived %d Android version(s) from reviews\n", len(androidVersions))
+	allVersions = append(allVersions, androidVersions...)
+
 	fmt.Println()
 
-	// Export to CSV
+	// Export to XLSX
 	if len(allReviews) > 0 {
 		exeDir := "."
 		if exePath, err := os.Executable(); err == nil {
@@ -113,13 +132,13 @@ func main() {
 		os.MkdirAll(exportDir, 0755)
 
 		today := time.Now().Format("2006-01-02")
-		csvFile := filepath.Join(exportDir, fmt.Sprintf("reviews_%s_to_%s.csv", dateInput, today))
+		xlsxFile := filepath.Join(exportDir, fmt.Sprintf("reviews_%s_to_%s.xlsx", dateInput, today))
 
-		if err := exportCSV(csvFile, allReviews); err != nil {
-			fmt.Fprintf(os.Stderr, "✗ Error writing CSV: %v\n", err)
+		if err := exportXLSX(xlsxFile, allReviews, allVersions); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Error writing XLSX: %v\n", err)
 		} else {
-			fmt.Printf("Exported %d review(s) to %s\n", len(allReviews), csvFile)
-			openFile(csvFile)
+			fmt.Printf("Exported %d review(s) to %s\n", len(allReviews), xlsxFile)
+			openFile(xlsxFile)
 		}
 	} else {
 		fmt.Println("No reviews found since", dateInput)
@@ -141,6 +160,13 @@ type Review struct {
 	Body     string
 	Rating   int
 	Date     string
+	Version  string
+}
+
+type VersionRelease struct {
+	Platform    string
+	Version     string
+	ReleaseDate string
 }
 
 // ============================================================
@@ -153,69 +179,112 @@ func fetchAppleReviews(since time.Time) ([]Review, error) {
 		return nil, fmt.Errorf("creating JWT: %w", err)
 	}
 
-	var allReviews []Review
-	// Sort newest first; no server-side date filter available, so we paginate
-	// and stop once reviews are older than the requested date.
-	nextURL := fmt.Sprintf(
-		"https://api.appstoreconnect.apple.com/v1/apps/%s/customerReviews?sort=-createdDate&limit=100",
+	// Fetch all app store versions to get version strings per review
+	type versionInfo struct {
+		id      string
+		version string
+	}
+	var versions []versionInfo
+	versionsURL := fmt.Sprintf(
+		"https://api.appstoreconnect.apple.com/v1/apps/%s/appStoreVersions?fields[appStoreVersions]=versionString&limit=200",
 		appleAppID,
 	)
-
-	done := false
-	for nextURL != "" && !done {
-		req, err := http.NewRequest("GET", nextURL, nil)
-		if err != nil {
-			return nil, err
-		}
+	for versionsURL != "" {
+		req, _ := http.NewRequest("GET", versionsURL, nil)
 		req.Header.Set("Authorization", "Bearer "+token)
-
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetching app store versions: %w", err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-
 		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
+			return nil, fmt.Errorf("appStoreVersions API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
 		}
-
-		var result struct {
+		var vResult struct {
 			Data []struct {
+				ID         string `json:"id"`
 				Attributes struct {
-					Rating           int    `json:"rating"`
-					Title            string `json:"title"`
-					Body             string `json:"body"`
-					ReviewerNickname string `json:"reviewerNickname"`
-					CreatedDate      string `json:"createdDate"`
+					VersionString string `json:"versionString"`
 				} `json:"attributes"`
 			} `json:"data"`
 			Links struct {
 				Next string `json:"next"`
 			} `json:"links"`
 		}
-
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("parsing response: %w", err)
+		if err := json.Unmarshal(body, &vResult); err != nil {
+			return nil, fmt.Errorf("parsing versions response: %w", err)
 		}
+		for _, v := range vResult.Data {
+			versions = append(versions, versionInfo{id: v.ID, version: v.Attributes.VersionString})
+		}
+		versionsURL = vResult.Links.Next
+	}
 
-		for _, d := range result.Data {
-			t, err := time.Parse(time.RFC3339, d.Attributes.CreatedDate)
-			if err == nil && t.Before(since) {
-				done = true
-				break
+	// Fetch reviews per version
+	var allReviews []Review
+	for _, v := range versions {
+		nextURL := fmt.Sprintf(
+			"https://api.appstoreconnect.apple.com/v1/appStoreVersions/%s/customerReviews?sort=-createdDate&limit=100",
+			v.id,
+		)
+		done := false
+		for nextURL != "" && !done {
+			req, err := http.NewRequest("GET", nextURL, nil)
+			if err != nil {
+				return nil, err
 			}
-			allReviews = append(allReviews, Review{
-				Platform: "iOS",
-				Author:   d.Attributes.ReviewerNickname,
-				Title:    d.Attributes.Title,
-				Body:     d.Attributes.Body,
-				Rating:   d.Attributes.Rating,
-				Date:     d.Attributes.CreatedDate[:10],
-			})
-		}
+			req.Header.Set("Authorization", "Bearer "+token)
 
-		nextURL = result.Links.Next
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
+			}
+
+			var result struct {
+				Data []struct {
+					Attributes struct {
+						Rating           int    `json:"rating"`
+						Title            string `json:"title"`
+						Body             string `json:"body"`
+						ReviewerNickname string `json:"reviewerNickname"`
+						CreatedDate      string `json:"createdDate"`
+					} `json:"attributes"`
+				} `json:"data"`
+				Links struct {
+					Next string `json:"next"`
+				} `json:"links"`
+			}
+
+			if err := json.Unmarshal(body, &result); err != nil {
+				return nil, fmt.Errorf("parsing response: %w", err)
+			}
+
+			for _, d := range result.Data {
+				t, err := time.Parse(time.RFC3339, d.Attributes.CreatedDate)
+				if err == nil && t.Before(since) {
+					done = true
+					break
+				}
+				allReviews = append(allReviews, Review{
+					Platform: "iOS",
+					Author:   d.Attributes.ReviewerNickname,
+					Title:    d.Attributes.Title,
+					Body:     d.Attributes.Body,
+					Rating:   d.Attributes.Rating,
+					Date:     d.Attributes.CreatedDate[:10],
+					Version:  v.version,
+				})
+			}
+
+			nextURL = result.Links.Next
+		}
 	}
 
 	return allReviews, nil
@@ -317,7 +386,7 @@ func fetchAndParseGCSCSV(ctx context.Context, bucket *storage.BucketHandle, obje
 	// Check if the object exists first
 	obj := bucket.Object(objectName)
 	_, err := obj.Attrs(ctx)
-	if err == storage.ErrObjectNotExist {
+	if errors.Is(err, storage.ErrObjectNotExist) {
 		return nil, errNotFound
 	}
 	if err != nil {
@@ -387,6 +456,11 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 			title = strings.TrimSpace(record[idx])
 		}
 
+		version := ""
+		if idx, ok := col["App Version Name"]; ok && idx < len(record) {
+			version = strings.TrimSpace(record[idx])
+		}
+
 		reviews = append(reviews, Review{
 			Platform: "Android",
 			Author:   "", // GCS exports don't include author names
@@ -394,6 +468,7 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 			Body:     body,
 			Rating:   rating,
 			Date:     reviewTime.Format("2006-01-02 15:04"),
+			Version:  version,
 		})
 	}
 
@@ -401,35 +476,175 @@ func parseGCSReviewCSV(reader io.Reader, since time.Time) ([]Review, error) {
 }
 
 // ============================================================
-// CSV Export
+// Apple Version History
 // ============================================================
 
-func exportCSV(filename string, reviews []Review) error {
-	f, err := os.Create(filename)
+func fetchAppleVersionHistory() ([]VersionRelease, error) {
+	token, err := createAppleJWT()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("creating JWT: %w", err)
 	}
-	defer f.Close()
 
-	// Write BOM for Excel compatibility
-	f.Write([]byte{0xEF, 0xBB, 0xBF})
+	var versions []VersionRelease
+	nextURL := fmt.Sprintf(
+		"https://api.appstoreconnect.apple.com/v1/apps/%s/appStoreVersions?fields[appStoreVersions]=versionString,createdDate,appStoreState&limit=100",
+		appleAppID,
+	)
 
-	w := csv.NewWriter(f)
-	defer w.Flush()
+	for nextURL != "" {
+		req, err := http.NewRequest("GET", nextURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 
-	w.Write([]string{"Platform", "Date", "Rating", "Author", "Title", "Review"})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(body), 300))
+		}
+
+		var result struct {
+			Data []struct {
+				Attributes struct {
+					VersionString string `json:"versionString"`
+					CreatedDate   string `json:"createdDate"`
+					AppStoreState string `json:"appStoreState"`
+				} `json:"attributes"`
+			} `json:"data"`
+			Links struct {
+				Next string `json:"next"`
+			} `json:"links"`
+		}
+
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("parsing response: %w", err)
+		}
+
+		for _, d := range result.Data {
+			if d.Attributes.AppStoreState != "READY_FOR_DISTRIBUTION" &&
+				d.Attributes.AppStoreState != "READY_FOR_SALE" {
+				continue
+			}
+			releaseDate := d.Attributes.CreatedDate
+			if len(releaseDate) >= 10 {
+				releaseDate = releaseDate[:10]
+			}
+			versions = append(versions, VersionRelease{
+				Platform:    "iOS",
+				Version:     d.Attributes.VersionString,
+				ReleaseDate: releaseDate,
+			})
+		}
+
+		nextURL = result.Links.Next
+	}
+
+	return versions, nil
+}
+
+// ============================================================
+// Android Version History (derived from review data)
+// ============================================================
+
+func deriveAndroidVersionHistory(reviews []Review) []VersionRelease {
+	earliest := make(map[string]string) // version -> earliest date
 	for _, r := range reviews {
-		w.Write([]string{
-			r.Platform,
-			r.Date,
-			fmt.Sprintf("%d", r.Rating),
-			r.Author,
-			r.Title,
-			r.Body,
+		if r.Platform != "Android" || r.Version == "" {
+			continue
+		}
+		date := r.Date
+		if len(date) > 10 {
+			date = date[:10] // truncate time part
+		}
+		if existing, ok := earliest[r.Version]; !ok || date < existing {
+			earliest[r.Version] = date
+		}
+	}
+
+	var versions []VersionRelease
+	for v, d := range earliest {
+		versions = append(versions, VersionRelease{
+			Platform:    "Android",
+			Version:     v,
+			ReleaseDate: d,
 		})
 	}
+	return versions
+}
 
-	return w.Error()
+// ============================================================
+// XLSX Export
+// ============================================================
+
+func exportXLSX(filename string, reviews []Review, versions []VersionRelease) error {
+	f := excelize.NewFile()
+	defer f.Close()
+
+	// Bold header style
+	boldStyle, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true},
+	})
+
+	// --- Sheet 1: Reviews ---
+	sheet1 := "Reviews"
+	f.SetSheetName("Sheet1", sheet1)
+
+	reviewHeaders := []string{"Platform", "Date", "Rating", "Author", "Title", "Version", "Review"}
+	for i, h := range reviewHeaders {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		f.SetCellValue(sheet1, cell, h)
+		f.SetCellStyle(sheet1, cell, cell, boldStyle)
+	}
+
+	for row, r := range reviews {
+		rowNum := row + 2
+		f.SetCellValue(sheet1, cellName(1, rowNum), r.Platform)
+		f.SetCellValue(sheet1, cellName(2, rowNum), r.Date)
+		f.SetCellValue(sheet1, cellName(3, rowNum), r.Rating)
+		f.SetCellValue(sheet1, cellName(4, rowNum), r.Author)
+		f.SetCellValue(sheet1, cellName(5, rowNum), r.Title)
+		f.SetCellValue(sheet1, cellName(6, rowNum), r.Version)
+		f.SetCellValue(sheet1, cellName(7, rowNum), r.Body)
+	}
+
+	// --- Sheet 2: Version History ---
+	sheet2 := "Version History"
+	f.NewSheet(sheet2)
+
+	// Sort versions: by platform then release date descending
+	sort.Slice(versions, func(i, j int) bool {
+		if versions[i].Platform != versions[j].Platform {
+			return versions[i].Platform < versions[j].Platform
+		}
+		return versions[i].ReleaseDate > versions[j].ReleaseDate
+	})
+
+	versionHeaders := []string{"Platform", "Version", "Release Date"}
+	for i, h := range versionHeaders {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		f.SetCellValue(sheet2, cell, h)
+		f.SetCellStyle(sheet2, cell, cell, boldStyle)
+	}
+
+	for row, v := range versions {
+		rowNum := row + 2
+		f.SetCellValue(sheet2, cellName(1, rowNum), v.Platform)
+		f.SetCellValue(sheet2, cellName(2, rowNum), v.Version)
+		f.SetCellValue(sheet2, cellName(3, rowNum), v.ReleaseDate)
+	}
+
+	return f.SaveAs(filename)
+}
+
+func cellName(col, row int) string {
+	name, _ := excelize.CoordinatesToCellName(col, row)
+	return name
 }
 
 // ============================================================
